@@ -1,0 +1,177 @@
+!pip install -q ultralytics
+
+# --- 1. Installation and Checks ---
+print("--- Installing YOLOv8 (Ultralytics) and Supervision ---")
+!pip install -q ultralytics supervision[assets]
+print("\n--- Ultralytics and Supervision installed successfully. ---")
+import os
+import cv2
+import numpy as np
+import ultralytics
+import supervision as sv
+from IPython import display
+from collections import defaultdict, deque
+
+# --- 1. Installation and Checks ---
+print("--- Installing YOLOv8 (Ultralytics) and Supervision ---")
+!pip install -q ultralytics
+!pip install supervision[assets]==0.24.0
+display.clear_output()
+print("\n--- Ultralytics and Supervision installed successfully. ---")
+ultralytics.checks()
+print(f"supervision.__version__: {sv.__version__}")
+
+# --- 2. Model Loading and Class Definition ---
+model_weights_path = '/kaggle/input/yolov8m-pt/yolov8m.pt'
+print(f"\n--- Loading Custom Trained Model Weights from: {model_weights_path} ---")
+from ultralytics import YOLO 
+model = YOLO(model_weights_path)
+print("Model loaded successfully.")
+
+CLASS_NAMES_DICT = model.model.names
+SELECTED_CLASS_NAMES = ['car','bus','truck'] 
+SELECTED_CLASS_IDS = [
+    {value: key for key, value in CLASS_NAMES_DICT.items()}[class_name]
+    for class_name
+    in SELECTED_CLASS_NAMES
+]
+print(f"Tracking classes: {SELECTED_CLASS_NAMES} with IDs: {SELECTED_CLASS_IDS}")
+
+# --- 3. Video Path Configuration ---
+print("\n--- Setting SOURCE_VIDEO_PATH to the specific IR bird video ---")
+
+SOURCE_VIDEO_PATH = "/kaggle/input/uav003/uav0000003_00000_s_tracking175WithGroundTruth (4).mp4"
+
+if os.path.exists(SOURCE_VIDEO_PATH):
+    print(f"Selected fixed input video: {SOURCE_VIDEO_PATH}")
+else:
+    print(f"Error: The specified video path does not exist: {SOURCE_VIDEO_PATH}")
+
+TARGET_VIDEO_PATH = "/kaggle/working/tracked_video003.mp4"
+
+# --- 4. Initialize Annotators and Tracker ---
+print("\n--- Initializing Annotators and ByteTrack with Adjusted Visuals ---")
+
+box_annotator = sv.BoxAnnotator(thickness=2) 
+label_annotator = sv.LabelAnnotator(
+    text_scale=0.2, 
+    text_color=sv.Color.WHITE
+)
+
+trace_annotator = sv.TraceAnnotator(
+    trace_length=99999, 
+    color=sv.Color.GREEN 
+)
+
+byte_tracker = sv.ByteTrack(
+    track_activation_threshold=0.25,
+    lost_track_buffer=30,
+    minimum_matching_threshold=0.8,
+    frame_rate=30, 
+    minimum_consecutive_frames=3
+)
+byte_tracker.reset()
+
+track_area_history = defaultdict(lambda: deque(maxlen=5))
+
+# --- 5. Define the Callback Function for Video Processing ---
+def tracking_callback(frame: np.ndarray, index: int) -> np.ndarray:
+    results = model(frame, verbose=False)[0]
+    detections = sv.Detections.from_ultralytics(results)
+    detections = detections[np.isin(detections.class_id, SELECTED_CLASS_IDS)]
+    detections = byte_tracker.update_with_detections(detections)
+
+    labels = []
+    current_frame_direction_info_console = []
+    direction_texts_on_frame = []
+
+    annotated_frame = frame.copy()
+
+    if detections.tracker_id is not None and len(detections) > 0:
+        for i, (box, tracker_id, class_id, confidence) in enumerate(zip(detections.xyxy, detections.tracker_id, detections.class_id, detections.confidence)):
+            x1, y1, x2, y2 = box
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+
+            labels.append(f"#{tracker_id} {CLASS_NAMES_DICT[class_id]} {confidence:.2f}")
+
+            coord_text_pos = (int(x1), int(y2) + 18) 
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale_coords = 0.6 
+            font_thickness_coords = 1
+            text_color_white = (255, 255, 255)
+
+            cv2.putText(annotated_frame, f"({center_x:.0f},{center_y:.0f})", coord_text_pos, font, font_scale_coords, text_color_white, font_thickness_coords, cv2.LINE_AA)
+
+            current_area = (x2 - x1) * (y2 - y1)
+            if current_area <= 0: current_area = 1
+
+            track_area_history[tracker_id].append(current_area)
+
+            direction_status = "(Direction N/A)"
+            if len(track_area_history[tracker_id]) == track_area_history[tracker_id].maxlen:
+                avg_previous_area = sum(list(track_area_history[tracker_id])[:-1]) / (track_area_history[tracker_id].maxlen - 1)
+                area_change_threshold_ratio = 0.08
+
+                if current_area > avg_previous_area * (1 + area_change_threshold_ratio):
+                    direction_status = "(Approaching)"
+                elif current_area < avg_previous_area * (1 - area_change_threshold_ratio):
+                    direction_status = "(Receding)"
+                else:
+                    direction_status = "(Constant Distance)"
+
+            current_frame_direction_info_console.append(
+                f"  Track ID: {tracker_id}, Class: {CLASS_NAMES_DICT[class_id]}, Center (x, y): ({center_x:.0f}, {center_y:.0f}) {direction_status}"
+            )
+
+            direction_text_pos = (int(x1), int(y2) + 36)
+            direction_texts_on_frame.append({
+                'text': direction_status,
+                'position': direction_text_pos
+            })
+
+    annotated_frame = trace_annotator.annotate(scene=annotated_frame, detections=detections)
+    annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
+    annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
+
+    for direction_info in direction_texts_on_frame:
+        cv2.putText(annotated_frame, direction_info['text'], direction_info['position'], 
+                    font, font_scale_coords, text_color_white, font_thickness_coords, cv2.LINE_AA)
+
+    if current_frame_direction_info_console:
+        print(f"\n--- Frame {index} Trajectory Details ---")
+        for info in current_frame_direction_info_console:
+            print(info)
+
+    return annotated_frame
+
+
+# --- 6. Process the Video ---
+if SOURCE_VIDEO_PATH and os.path.exists(SOURCE_VIDEO_PATH):
+    print(f"\n--- Starting Video Processing and Tracking for: {os.path.basename(SOURCE_VIDEO_PATH)} ---")
+    print("\n--- IMPORTANT NOTE ON 'APPROACHING/RECEDING' INTERPRETATION ---")
+    print("The 'Approaching'/'Receding' status displayed is based on a heuristic: changes in the bounding box area over recent frames.")
+    print("If an object's bounding box consistently gets larger, it's inferred as 'Approaching'. If it gets smaller, 'Receding'.")
+    print("This is an APPROXIMATION. Factors like object rotation, camera zoom, or detection fluctuations can affect bounding box size independently of actual distance.")
+    print("For truly robust depth perception, 3D data (e.g., from stereo cameras, LiDAR) or more advanced techniques are generally required.")
+    print("------------------------------------------------------------------")
+
+    video_info = sv.VideoInfo.from_video_path(SOURCE_VIDEO_PATH)
+    print(f"Video Info: {video_info}")
+
+    sv.process_video(
+        source_path=SOURCE_VIDEO_PATH,
+        target_path=TARGET_VIDEO_PATH,
+        callback=tracking_callback
+    )
+    print(f"\n--- Video Tracking Complete ---")
+    print(f"Tracked video saved to: {TARGET_VIDEO_PATH}")
+    print("You can download this video from your Kaggle '/kaggle/working/' directory to view the results.")
+else:
+    print("\nSkipping video processing because SOURCE_VIDEO_PATH is not set or file does not exist.")
+
+
+
+
+
+
