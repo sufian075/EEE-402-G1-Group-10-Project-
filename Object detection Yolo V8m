@@ -1,0 +1,441 @@
+# Install YOLOv8 if not available
+!pip install ultralytics --quiet
+
+# Then import it
+from ultralytics import YOLO
+
+
+import yaml
+
+data = {
+    'path': '/kaggle/input/visdrone-dataset/VisDrone_Dataset',
+    'train': 'VisDrone2019-DET-train/images',
+    'val': 'VisDrone2019-DET-val/images',
+    'test': 'VisDrone2019-DET-test-dev/images',
+    'nc': 10,
+    'names': [
+        'pedestrian', 'people', 'bicycle', 'car', 'van',
+        'truck', 'tricycle', 'awning-tricycle', 'bus', 'motor'
+    ]
+}
+
+yaml_path = '/kaggle/working/visdrone.yaml'
+with open(yaml_path, 'w') as f:
+    yaml.dump(data, f, sort_keys=False)
+
+print("visdrone.yaml created.")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ultralytics import YOLO as YOLOEngine  # Ultralytics training interface
+
+class SepConv(nn.Module):
+    """
+    Depthwise‑separable conv that matches the nn.Conv2d signature.
+    """
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1,
+                 padding=None, groups=1, bias=False, act=True):
+        super().__init__()
+        if padding is None:
+            padding = kernel_size // 2
+        # depthwise: groups=in_ch
+        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size, stride,
+                                   padding, groups=in_ch, bias=bias)
+        # pointwise: 1×1
+        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, 1, 0, bias=bias)
+        self.bn = nn.BatchNorm2d(out_ch, eps=0.001, momentum=0.03)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.bn(x)
+        return self.act(x)
+# Basic building blocks
+class Conv(nn.Module):
+    def __init__(self, in_ch, out_ch, k=1, s=1, p=None, groups=1, bias=False, act=True):
+        super().__init__()
+        p = k // 2 if p is None else p
+        #self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, groups=groups, bias=bias)
+        self.conv = SepConv(in_ch, out_ch, k, s, p, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(out_ch, eps=0.001, momentum=0.03)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+class Bottleneck(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        c_ = out_ch // 2
+        self.cv1 = Conv(in_ch, c_, 1, 1)
+        self.cv2 = Conv(c_, out_ch, 3, 1)
+    def forward(self, x):
+        return self.cv2(self.cv1(x))
+class C2f(nn.Module):
+    def __init__(self, in_ch, out_ch, n=1):
+        super().__init__()
+        c_ = out_ch // 2
+        self.cv1 = Conv(in_ch, out_ch, 1, 1)
+        self.cv2 = Conv(in_ch * 2, out_ch, 1, 1)
+        self.m = nn.ModuleList(Bottleneck(out_ch, c_) for _ in range(n))
+    def forward(self, x):
+        y1 = self.cv1(x)
+        y2 = []
+        for m in self.m:
+            y1 = m(y1)
+            y2.append(y1)
+        return self.cv2(torch.cat([x, *y2], dim=1))
+class SPPF(nn.Module):
+    def __init__(self, in_ch, out_ch, k=5):
+        super().__init__()
+        c_ = in_ch // 2
+        self.cv1 = Conv(in_ch, c_, 1, 1)
+        self.cv2 = Conv(c_ * 2, out_ch, 1, 1)
+        self.m = nn.MaxPool2d(k, 1, k // 2)
+    def forward(self, x):
+        x = self.cv1(x)
+        return self.cv2(torch.cat([x, self.m(x)], dim=1))
+class Concat(nn.Module):
+    def __init__(self, dim=1): super().__init__(); self.dim = dim
+    def forward(self, x): return torch.cat(x, dim=self.dim)
+class DFL(nn.Module):
+    def __init__(self): super().__init__(); self.conv = nn.Conv2d(16,1,1,bias=False)
+    def forward(self, x): return self.conv(x)
+class Detect(nn.Module):
+    def __init__(self, nc, ch):
+        super().__init__()
+        self.cv2 = nn.ModuleList()
+        for c in ch:
+            self.cv2.append(nn.Sequential(
+                Conv(c, c, 3, 1),
+                Conv(c, c, 3, 1),
+                nn.Conv2d(c, c, 1, 1)
+            ))
+        self.cv3 = nn.ModuleList()
+        for c in ch:
+            self.cv3.append(nn.Sequential(
+                Conv(c, c, 3, 1),
+                Conv(c, c, 3, 1),
+                nn.Conv2d(c, nc, 1, 1)
+            ))
+        self.dfl = DFL()
+    def forward(self, x):
+        return [self.dfl(self.cv3[i](self.cv2[i](f))) for i,f in enumerate(x)]
+class YOLOModel(nn.Module):
+    def __init__(self, config='yolo11n.yaml'):
+        super().__init__()
+        # Backbone 1 (k=3)
+        self.layer0  = Conv(3, 48, 3, 2)
+        self.layer1  = Conv(48,96, 3, 2)
+        self.layer2  = C2f(96, 96, n=2)
+        self.layer3  = Conv(96,192,3, 2)
+        self.layer4  = C2f(192,192,n=4)
+        self.layer5  = Conv(192,384,3, 2)
+        self.layer6  = C2f(384,384,n=4)
+        self.layer7  = Conv(384,576,3, 2)
+        self.layer8  = C2f(576,576,n=2)
+        self.layer9  = SPPF(576,576,5)
+
+        # Backbone 2 (k=5)
+        self.layer0A = Conv(3, 48, 5, 2)
+        self.layer1A = Conv(48,96, 5, 2)
+        self.layer2A = C2f(96, 96, n=2)
+        self.layer3A = Conv(96,192,5, 2)
+        self.layer4A = C2f(192,192,n=4)
+        self.layer5A = Conv(192,384,5, 2)
+        self.layer6A = C2f(384,384,n=4)
+        self.layer7A = Conv(384,576,5, 2)
+        self.layer8A = C2f(576,576,n=2)
+        self.layer9A = SPPF(576,576,5)
+
+        # Backbone 3 (k=7)
+        self.layer0B = Conv(3, 48, 7, 2)
+        self.layer1B = Conv(48,96, 7, 2)
+        self.layer2B = C2f(96, 96, n=2)
+        self.layer3B = Conv(96,192,7, 2)
+        self.layer4B = C2f(192,192,n=4)
+        self.layer5B = Conv(192,384,7, 2)
+        self.layer6B = C2f(384,384,n=4)
+        self.layer7B = Conv(384,576,7, 2)
+        self.layer8B = C2f(576,576,n=2)
+        self.layer9B = SPPF(576,576,5)
+
+        # Neck & PAN-like fusion
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.concat   = Concat(1)
+        self.convFuse1 = Conv(576*3, 576*2, 1, 1)
+        self.layer12   = C2f(576*2, 384, n=2)
+        self.convFuse2 = Conv(384*4, 384*2, 1, 1)
+        self.layer15   = C2f(384*2, 192, n=2)
+
+        # Head
+        self.layer16 = Conv(192,192,3,2)
+        self.layer17 = Concat(1)
+        self.layer18 = C2f(192+384, 384, n=2)
+        self.layer19 = Conv(384,384,3,2)
+        self.layer20 = Concat(1)
+        self.layer21 = C2f(576+576*2, 576, n=2)
+        self.detect  = Detect(10, [192, 576, 576])  # replace with Detect(nc, ch)
+
+        # Save & Ultralytics
+        self.config = config
+        self.yolo   = YOLOEngine(config)
+        #self.yolo.model = self
+        import weakref
+        self.yolo.model = weakref.proxy(self)
+        self.yolo.model.yaml = config
+
+    def forward(self, x):
+        # run backbones
+        x0  = self.layer0(x);  x1  = self.layer1(x0);  x2  = self.layer2(x1)
+        x3  = self.layer3(x2);  x4  = self.layer4(x3);  x5  = self.layer5(x4)
+        x6  = self.layer6(x5);  x7  = self.layer7(x6);  x8  = self.layer8(x7)
+        x9  = self.layer9(x8)
+
+        x0A = self.layer0A(x);  x1A = self.layer1A(x0A); x2A = self.layer2A(x1A)
+        x3A = self.layer3A(x2A); x4A = self.layer4A(x3A); x5A = self.layer5A(x4A)
+        x6A = self.layer6A(x5A); x7A = self.layer7A(x6A); x8A = self.layer8A(x7A)
+        x9A = self.layer9A(x8A)
+
+        x0B = self.layer0B(x);  x1B = self.layer1B(x0B); x2B = self.layer2B(x1B)
+        x3B = self.layer3B(x2B); x4B = self.layer4B(x3B); x5B = self.layer5B(x4B)
+        x6B = self.layer6B(x5B); x7B = self.layer7B(x6B); x8B = self.layer8B(x7B)
+        x9B = self.layer9B(x8B)
+
+        # fusion at /32 -> /16
+        u9  = self.upsample(x9);  u9A = self.upsample(x9A);  u9B = self.upsample(x9B)
+        f16 = self.concat([u9, u9A, u9B])
+        f16 = self.convFuse1(f16)
+        p16 = self.layer12(f16)
+
+        # fusion at /16 -> /8
+        u16 = self.upsample(p16)
+        f8  = self.concat([u16, x6, x6A, x6B])
+        f8  = self.convFuse2(f8)
+        p8  = self.layer15(f8)
+
+        # head predictions
+        d16 = self.layer16(p8)
+        m16 = self.layer17([d16, p16])
+        d32 = self.layer18(m16)
+        d32 = self.layer19(d32)
+        m32 = self.layer20([d32, x9, x9A, x9B])
+        out = self.layer21(m32)
+
+        return self.detect([p8, m16, out])
+
+    def save_model(self, path='yolomodel.pth'):
+        torch.save(self.state_dict(), path)
+        print(f"Model saved to {path}")
+
+    def train(self, *args, **kwargs):   return self.yolo.train(*args, **kwargs)
+    def val(self,   *args, **kwargs):   return self.yolo.val(*args, **kwargs)
+    def predict(self,*args, **kwargs):   return self.yolo.predict(*args, **kwargs)
+    def export(self, *args, **kwargs):  return self.yolo.export(*args, **kwargs)
+    @property
+    def names(self):                   return self.yolo.names
+class YOLOModel(nn.Module):
+    def __init__(self, config='yolo11n.yaml'):
+        super().__init__()
+        # Backbone 1 (k=3)
+        self.layer0  = Conv(3, 48, 3, 2)
+        self.layer1  = Conv(48,96, 3, 2)
+        self.layer2  = C2f(96, 96, n=2)
+        self.layer3  = Conv(96,192,3, 2)
+        self.layer4  = C2f(192,192,n=4)
+        self.layer5  = Conv(192,384,3, 2)
+        self.layer6  = C2f(384,384,n=4)
+        self.layer7  = Conv(384,576,3, 2)
+        self.layer8  = C2f(576,576,n=2)
+        self.layer9  = SPPF(576,576,5)
+
+        # Backbone 2 (k=5)
+        self.layer0A = Conv(3, 48, 5, 2)
+        self.layer1A = Conv(48,96, 5, 2)
+        self.layer2A = C2f(96, 96, n=2)
+        self.layer3A = Conv(96,192,5, 2)
+        self.layer4A = C2f(192,192,n=4)
+        self.layer5A = Conv(192,384,5, 2)
+        self.layer6A = C2f(384,384,n=4)
+        self.layer7A = Conv(384,576,5, 2)
+        self.layer8A = C2f(576,576,n=2)
+        self.layer9A = SPPF(576,576,5)
+
+        # Backbone 3 (k=7)
+        self.layer0B = Conv(3, 48, 7, 2)
+        self.layer1B = Conv(48,96, 7, 2)
+        self.layer2B = C2f(96, 96, n=2)
+        self.layer3B = Conv(96,192,7, 2)
+        self.layer4B = C2f(192,192,n=4)
+        self.layer5B = Conv(192,384,7, 2)
+        self.layer6B = C2f(384,384,n=4)
+        self.layer7B = Conv(384,576,7, 2)
+        self.layer8B = C2f(576,576,n=2)
+        self.layer9B = SPPF(576,576,5)
+
+        # Neck & PAN-like fusion
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.concat   = Concat(1)
+        self.convFuse1 = Conv(576*3, 576*2, 1, 1)
+        self.layer12   = C2f(576*2, 384, n=2)
+        self.convFuse2 = Conv(384*4, 384*2, 1, 1)
+        self.layer15   = C2f(384*2, 192, n=2)
+
+        # Head
+        self.layer16 = Conv(192,192,3,2)
+        self.layer17 = Concat(1)
+        self.layer18 = C2f(192+384, 384, n=2)
+        self.layer19 = Conv(384,384,3,2)
+        self.layer20 = Concat(1)
+        self.layer21 = C2f(576+576*2, 576, n=2)
+        self.detect  = Detect(10, [192, 576, 576])  # replace with Detect(nc, ch)
+
+        # Save & Ultralytics
+        self.config = config
+        self.yolo   = YOLOEngine(config)
+        #self.yolo.model = self
+        import weakref
+        self.yolo.model = weakref.proxy(self)
+        self.yolo.model.yaml = config
+
+    def forward(self, x):
+        # run backbones
+        x0  = self.layer0(x);  x1  = self.layer1(x0);  x2  = self.layer2(x1)
+        x3  = self.layer3(x2);  x4  = self.layer4(x3);  x5  = self.layer5(x4)
+        x6  = self.layer6(x5);  x7  = self.layer7(x6);  x8  = self.layer8(x7)
+        x9  = self.layer9(x8)
+
+        x0A = self.layer0A(x);  x1A = self.layer1A(x0A); x2A = self.layer2A(x1A)
+        x3A = self.layer3A(x2A); x4A = self.layer4A(x3A); x5A = self.layer5A(x4A)
+        x6A = self.layer6A(x5A); x7A = self.layer7A(x6A); x8A = self.layer8A(x7A)
+        x9A = self.layer9A(x8A)
+
+        x0B = self.layer0B(x);  x1B = self.layer1B(x0B); x2B = self.layer2B(x1B)
+        x3B = self.layer3B(x2B); x4B = self.layer4B(x3B); x5B = self.layer5B(x4B)
+        x6B = self.layer6B(x5B); x7B = self.layer7B(x6B); x8B = self.layer8B(x7B)
+        x9B = self.layer9B(x8B)
+
+        # fusion at /32 -> /16
+        u9  = self.upsample(x9);  u9A = self.upsample(x9A);  u9B = self.upsample(x9B)
+        f16 = self.concat([u9, u9A, u9B])
+        f16 = self.convFuse1(f16)
+        p16 = self.layer12(f16)
+
+        # fusion at /16 -> /8
+        u16 = self.upsample(p16)
+        f8  = self.concat([u16, x6, x6A, x6B])
+        f8  = self.convFuse2(f8)
+        p8  = self.layer15(f8)
+
+        # head predictions
+        d16 = self.layer16(p8)
+        m16 = self.layer17([d16, p16])
+        d32 = self.layer18(m16)
+        d32 = self.layer19(d32)
+        m32 = self.layer20([d32, x9, x9A, x9B])
+        out = self.layer21(m32)
+
+        return self.detect([p8, m16, out])
+
+    def save_model(self, path='yolomodel.pth'):
+        torch.save(self.state_dict(), path)
+        print(f"Model saved to {path}")
+
+    def train(self, *args, **kwargs):   return self.yolo.train(*args, **kwargs)
+    def val(self,   *args, **kwargs):   return self.yolo.val(*args, **kwargs)
+    def predict(self,*args, **kwargs):   return self.yolo.predict(*args, **kwargs)
+    def export(self, *args, **kwargs):  return self.yolo.export(*args, **kwargs)
+    @property
+    def names(self):                   return self.yolo.names
+total = sum(p.numel() for p in model.parameters())
+print(f"Total params: {total}")
+
+# ---------------------
+# Step 2: Train YOLOv8
+# ---------------------
+#from ultralytics import YOLO
+
+#model = YOLO('yolov8m.pt') 
+#print("Model: ", {model.model})
+
+model.train(
+    data='visdrone.yaml',
+    epochs=6,
+    imgsz=960,
+    batch=8, 
+    project='visdrone_yolo',
+    name='yolov8m_highres',
+    cache=True
+)
+
+model.save_model('/kaggle/working/yolomodel_trained.pth')
+#model.save_full_model('yolomodel_trained.pt')
+
+
+metrics = model.val(data=yaml_path, split='test')
+
+print(f"\n Evaluation Results:")
+print(f"Test mAP@0.5: {metrics.box.map50:.4f}")
+print(f"Test mAP@0.5:0.95: {metrics.box.map:.4f}")
+
+
+# ---------------------
+# Step 4: Visualize training metrics
+# ---------------------
+import matplotlib.pyplot as plt
+import os
+import pandas as pd
+
+# Path to training results CSV
+csv_path = '/kaggle/working/visdrone_yolo/yolov8n_run/results.csv'
+if os.path.exists(csv_path):
+    df = pd.read_csv(csv_path)
+
+    plt.figure(figsize=(16, 10))
+
+    plt.subplot(2, 2, 1)
+    plt.plot(df['epoch'], df['train/box_loss'], label='Box Loss')
+    plt.plot(df['epoch'], df['val/box_loss'], label='Val Box Loss')
+    plt.title('Box Loss')
+    plt.legend()
+
+    plt.subplot(2, 2, 2)
+    plt.plot(df['epoch'], df['metrics/precision(B)'], label='Precision')
+    plt.plot(df['epoch'], df['metrics/recall(B)'], label='Recall')
+    plt.title('Precision & Recall')
+    plt.legend()
+
+    plt.subplot(2, 2, 3)
+    plt.plot(df['epoch'], df['metrics/mAP50(B)'], label='mAP@0.5')
+    plt.plot(df['epoch'], df['metrics/mAP50-95(B)'], label='mAP@0.5:0.95')
+    plt.title('mAP')
+    plt.legend()
+
+    plt.subplot(2, 2, 4)
+    plt.plot(df['epoch'], df['train/cls_loss'], label='Class Loss')
+    plt.plot(df['epoch'], df['val/cls_loss'], label='Val Class Loss')
+    plt.title('Class Loss')
+    plt.legend()
+
+    plt.suptitle(' YOLOv8 Training Metrics (yolov8n)', fontsize=16)
+    plt.tight_layout()
+    plt.show()
+else:
+    print(" results.csv not found — training might have failed or not yet finished.")
+
+metrics = model.val(data=yaml_path, split='test')
+print(f"Test mAP@0.5:           {metrics.box.map50:.4f}")
+print(f"Test mAP@0.5:0.95:      {metrics.box.map:.4f}")
+print(f"Test Precision (mean):  {metrics.box.mp:.4f}")
+print(f"Test Recall (mean):     {metrics.box.mr:.4f}")
+
+# Per-class mAP table
+print("\n📋 Per-Class mAP@0.5:")
+class_names = metrics.names
+per_class_map50 = metrics.box.maps  # list of mAP@0.5 per class
+
+for i, ap in enumerate(per_class_map50):
+    print(f"{i:2d} {class_names[i]:18s}: {ap:.4f}")
+
+
+
