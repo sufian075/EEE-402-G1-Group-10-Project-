@@ -1,0 +1,789 @@
+import os
+import json
+from tqdm import tqdm
+from PIL import Image
+
+def convert_yolo_to_coco(root_path, splits, output_root='/kaggle/working/'):
+    """
+    Convert YOLO format annotations to COCO format and save to output_root.
+    YOLO format: class_id center_x center_y width height (normalized 0-1)
+    """
+    # Your dataset class mapping (0-9)
+    yolo_classes = {
+        0: 'pedestrian',
+        1: 'people',
+        2: 'bicycle',
+        3: 'car',
+        4: 'van',
+        5: 'truck',
+        6: 'tricycle',
+        7: 'awning-tricycle',
+        8: 'bus',
+        9: 'motor'
+    }
+    
+    # Create COCO category mapping (must start from 1)
+    coco_categories = []
+    yolo_to_coco_id = {}
+    
+    for coco_id, (yolo_id, class_name) in enumerate(yolo_classes.items(), 1):
+        coco_categories.append({
+            "id": coco_id,
+            "name": class_name,
+            "supercategory": "object"  # More standard supercategory
+        })
+        yolo_to_coco_id[yolo_id] = coco_id
+    
+    print(f"Class mapping: {yolo_to_coco_id}")
+    
+    for split in splits:
+        print(f'\nProcessing {split} split...')
+        
+        # Directory paths
+        split_dir = os.path.join(root_path, split)
+        img_dir = os.path.join(split_dir, 'images')
+        ann_dir = os.path.join(split_dir, 'labels')  # Using 'labels' as in your original code
+        
+        # Check if directories exist
+        if not os.path.exists(img_dir):
+            print(f"Warning: Image directory not found: {img_dir}")
+            continue
+        if not os.path.exists(ann_dir):
+            print(f"Warning: Annotation directory not found: {ann_dir}")
+            continue
+            
+        output_file = os.path.join(output_root, f'{split}_coco_annotations.json')
+        
+        # COCO format template
+        coco_format = {
+            "info": {
+                "description": f"YOLO format {split} set converted to COCO format",
+                "version": "1.0",
+                "year": 2024,
+                "contributor": "Dataset",
+                "date_created": "2024"
+            },
+            "licenses": [{"id": 1, "name": "Unknown", "url": ""}],
+            "categories": coco_categories,
+            "images": [],
+            "annotations": []
+        }
+        
+        image_id = 1
+        annotation_id = 1
+        
+        # Get all image files
+        img_files = [f for f in os.listdir(img_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        print(f"Found {len(img_files)} images")
+        
+        stats = {
+            'total_images': 0,
+            'images_with_annotations': 0,
+            'total_annotations': 0,
+            'ignored_annotations': 0,
+            'category_counts': {name: 0 for name in yolo_classes.values()}
+        }
+        
+        for img_file in tqdm(img_files, desc=f"Processing {split}"):
+            img_path = os.path.join(img_dir, img_file)
+            
+            # Check if corresponding annotation file exists first
+            base_name = os.path.splitext(img_file)[0]
+            ann_file = os.path.join(ann_dir, base_name + '.txt')
+            
+            # Skip images without annotation files
+            if not os.path.exists(ann_file):
+                print(f"Warning: No annotation file found for {img_file}, skipping...")
+                continue
+            
+            # Get image dimensions
+            try:
+                with Image.open(img_path) as img:
+                    width, height = img.size
+            except Exception as e:
+                print(f"Error reading image {img_file}: {e}")
+                continue
+            
+            # Verify image file actually exists and is readable
+            if not os.path.exists(img_path):
+                print(f"Warning: Image file does not exist: {img_path}")
+                continue
+            
+            stats['total_images'] += 1
+            image_annotations = 0
+            
+            # Process annotations
+            
+            if os.path.exists(ann_file):
+                try:
+                    with open(ann_file, 'r') as f:
+                        lines = f.readlines()
+                    
+                    # Only add image to COCO if it has valid annotations
+                    valid_annotations_for_image = []
+                    
+                    for line_num, line in enumerate(lines):
+                        line = line.strip()
+                        if not line:
+                            continue
+                            
+                        parts = line.split()  # Space-separated, not comma-separated
+                        if len(parts) < 5:
+                            continue
+                        
+                        try:
+                            # YOLO format: <class_id> <center_x> <center_y> <width> <height> (all normalized 0-1)
+                            category_id = int(parts[0])
+                            center_x = float(parts[1])
+                            center_y = float(parts[2])
+                            norm_w = float(parts[3])
+                            norm_h = float(parts[4])
+                            
+                            # Validate normalized coordinates (should be 0-1)
+                            if not (0 <= center_x <= 1 and 0 <= center_y <= 1 and 0 < norm_w <= 1 and 0 < norm_h <= 1):
+                                stats['ignored_annotations'] += 1
+                                continue
+                            
+                            # Skip invalid categories (only accept 0-9 for your dataset)
+                            if category_id not in yolo_to_coco_id:
+                                stats['ignored_annotations'] += 1
+                                continue
+                            
+                            # Convert normalized YOLO format to absolute COCO format
+                            w = norm_w * width
+                            h = norm_h * height
+                            x_min = (center_x * width) - (w / 2)
+                            y_min = (center_y * height) - (h / 2)
+                            
+                            coco_category_id = yolo_to_coco_id[category_id]
+                            category_name = yolo_classes[category_id]
+                            
+                            # Clamp bounding box to image boundaries
+                            x_min = max(0, x_min)
+                            y_min = max(0, y_min) 
+                            x_max = min(width, x_min + w)
+                            y_max = min(height, y_min + h)
+                            w = x_max - x_min
+                            h = y_max - y_min
+                            
+                            if w <= 0 or h <= 0:
+                                stats['ignored_annotations'] += 1
+                                continue
+                            
+                            # Store valid annotation
+                            valid_annotations_for_image.append({
+                                "id": annotation_id,
+                                "image_id": image_id,
+                                "category_id": coco_category_id,
+                                "bbox": [float(x_min), float(y_min), float(w), float(h)],
+                                "area": float(w * h),
+                                "iscrowd": 0,
+                                "segmentation": []
+                            })
+                            
+                            annotation_id += 1
+                            image_annotations += 1  
+                            stats['total_annotations'] += 1
+                            stats['category_counts'][category_name] += 1
+                            
+                        except (ValueError, IndexError) as e:
+                            stats['ignored_annotations'] += 1
+                            continue
+                
+                except Exception as e:
+                    print(f"Error reading annotation file {ann_file}: {e}")
+                    continue
+            
+            # Only add image and annotations if there are valid annotations
+            if valid_annotations_for_image:
+                # Add image info
+                coco_format["images"].append({
+                    "id": image_id,
+                    "file_name": img_file,
+                    "width": width,
+                    "height": height
+                })
+                
+                # Add all valid annotations for this image
+                coco_format["annotations"].extend(valid_annotations_for_image)
+                stats['images_with_annotations'] += 1
+                
+            image_id += 1
+        
+        # Save COCO format
+        os.makedirs(output_root, exist_ok=True)
+        with open(output_file, 'w') as f:
+            json.dump(coco_format, f, indent=2)
+        
+        # Print statistics
+        print(f'\n=== {split} Statistics ===')
+        print(f'Total images: {stats["total_images"]}')
+        print(f'Images with annotations: {stats["images_with_annotations"]}')
+        print(f'Total annotations: {stats["total_annotations"]}')
+        print(f'Ignored annotations: {stats["ignored_annotations"]}')
+        print(f'Category distribution:')
+        for category, count in stats['category_counts'].items():
+            print(f'  {category}: {count}')
+        print(f'Saved to: {output_file}')
+
+# CORRECTED: Check the actual directory structure first
+def check_yolo_structure(root_path):
+    """Check the actual directory structure of YOLO dataset"""
+    print("=== Checking YOLO Dataset Directory Structure ===")
+    
+    if not os.path.exists(root_path):
+        print(f"Root path does not exist: {root_path}")
+        return False
+    
+    print(f"Root path contents: {os.listdir(root_path)}")
+    
+    # Check each split
+    expected_splits = ['VisDrone2019-DET-train', 'VisDrone2019-DET-val', 'VisDrone2019-DET-test-dev']
+    valid_splits = []
+    
+    for split in expected_splits:
+        split_path = os.path.join(root_path, split)
+        if os.path.exists(split_path):
+            print(f"\n{split} contents: {os.listdir(split_path)}")
+            
+            # Check for images and labels directories  
+            img_dir = os.path.join(split_path, 'images')
+            ann_dir = os.path.join(split_path, 'labels')
+            
+            if os.path.exists(img_dir):
+                img_count = len([f for f in os.listdir(img_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+                print(f"  Images directory: {img_count} images found")
+            else:
+                print(f"  Images directory not found at {img_dir}")
+            
+            if os.path.exists(ann_dir):
+                ann_count = len([f for f in os.listdir(ann_dir) if f.endswith('.txt')])
+                print(f"  Labels directory: {ann_count} annotation files found")
+                valid_splits.append(split)
+            else:
+                print(f"  Labels directory not found at {ann_dir}")
+        else:
+            print(f"{split} not found")
+    
+    return valid_splits
+
+def validate_coco_dataset(annotation_file, images_root):
+    """
+    Validate that all images referenced in COCO annotation file actually exist
+    """
+    print(f"\n=== Validating COCO Dataset ===")
+    print(f"Annotation file: {annotation_file}")
+    print(f"Images root: {images_root}")
+    
+    if not os.path.exists(annotation_file):
+        print(f"ERROR: Annotation file not found: {annotation_file}")
+        return False
+    
+    if not os.path.exists(images_root):
+        print(f"ERROR: Images directory not found: {images_root}")
+        return False
+    
+    # Load COCO annotations
+    with open(annotation_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    print(f"Total images in annotation: {len(coco_data['images'])}")
+    print(f"Total annotations: {len(coco_data['annotations'])}")
+    
+    missing_images = []
+    existing_images = 0
+    
+    for img_info in coco_data['images']:
+        img_path = os.path.join(images_root, img_info['file_name'])
+        if os.path.exists(img_path):
+            existing_images += 1
+        else:
+            missing_images.append(img_info['file_name'])
+    
+    print(f"Existing images: {existing_images}")
+    print(f"Missing images: {len(missing_images)}")
+    
+    if missing_images:
+        print(f"\nFirst 10 missing images:")
+        for img in missing_images[:10]:
+            print(f"  - {img}")
+        
+        if len(missing_images) > 10:
+            print(f"  ... and {len(missing_images) - 10} more")
+        
+        return False
+    else:
+        print("✅ All images found! Dataset is valid.")
+        return True
+
+# First check the directory structure
+print("Checking directory structure...")
+root_path = '/kaggle/input/visdrone-dataset/VisDrone_Dataset'
+valid_splits = check_yolo_structure(root_path)
+
+if valid_splits:
+    print(f"\nProceeding with conversion for splits: {valid_splits}")
+    # Run conversion
+    convert_yolo_to_coco(
+        root_path,
+        splits=valid_splits,
+        output_root='/kaggle/working/'
+    )
+    
+    # Validate the converted datasets
+    print("\n" + "="*50)
+    print("VALIDATING CONVERTED DATASETS")
+    print("="*50)
+    
+    for split in valid_splits:
+        annotation_file = f'/kaggle/working/{split}_coco_annotations.json'
+        images_root = os.path.join(root_path, split, 'images')
+        
+        is_valid = validate_coco_dataset(annotation_file, images_root)
+        if not is_valid:
+            print(f"❌ {split} dataset has issues!")
+        else:
+            print(f"✅ {split} dataset is valid!")
+            
+else:
+    print("No valid splits found. Please check the dataset structure.")
+
+import os
+HOME = os.getcwd()
+print(HOME)
+
+!pip install -i https://test.pypi.org/simple/ supervision==0.3.0
+!pip install -q transformers
+!pip install -q pytorch-lightning
+!pip install -q roboflow
+!pip install -q timm
+
+import torch
+!nvcc --version
+TORCH_VERSION = ".".join(torch.__version__.split(".")[:2])
+CUDA_VERSION = torch.__version__.split("+")[-1]
+print("torch: ", TORCH_VERSION, "; cuda: ", CUDA_VERSION)
+
+import roboflow
+import supervision
+import transformers
+import pytorch_lightning
+
+print(
+    "roboflow:", roboflow.__version__, 
+    "; supervision:", supervision.__version__, 
+    "; transformers:", transformers.__version__, 
+    "; pytorch_lightning:", pytorch_lightning.__version__
+)
+
+import os
+
+IMAGE_NAME = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-val/images/0000291_04201_d_0000889.jpg"
+IMAGE_PATH = os.path.join(HOME, IMAGE_NAME)
+
+import torch
+from transformers import DetrForObjectDetection, DetrImageProcessor
+
+
+# settings
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+CHECKPOINT = 'facebook/detr-resnet-50'
+CONFIDENCE_TRESHOLD = 0.5
+IOU_TRESHOLD = 0.8
+
+image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
+model = DetrForObjectDetection.from_pretrained(CHECKPOINT)
+model.to(DEVICE)
+
+import cv2
+import torch
+import supervision as sv
+
+
+with torch.no_grad():
+
+    # load image and predict
+    image = cv2.imread(IMAGE_PATH)
+    inputs = image_processor(images=image, return_tensors='pt').to(DEVICE)
+    outputs = model(**inputs)
+
+    # post-process
+    target_sizes = torch.tensor([image.shape[:2]]).to(DEVICE)
+    results = image_processor.post_process_object_detection(
+        outputs=outputs, 
+        threshold=CONFIDENCE_TRESHOLD, 
+        target_sizes=target_sizes
+    )[0]
+
+# annotate
+detections = sv.Detections.from_transformers(transformers_results=results)
+
+labels = [
+    f"{model.config.id2label[class_id]} {confidence:0.2f}" 
+    for _, confidence, class_id, _ 
+    in detections
+]
+
+box_annotator = sv.BoxAnnotator()
+frame = box_annotator.annotate(scene=image, detections=detections, labels=labels)
+
+%matplotlib inline  
+sv.show_frame_in_notebook(frame, (16, 16))
+
+import os
+import torchvision
+
+
+class CocoDetection(torchvision.datasets.CocoDetection):
+    def __init__(
+        self, 
+        image_directory_path: str, 
+        annotation_file_path: str, 
+        image_processor,
+    ):
+        super(CocoDetection, self).__init__(image_directory_path, annotation_file_path)
+        self.image_processor = image_processor
+
+    def __getitem__(self, idx):
+        images, annotations = super(CocoDetection, self).__getitem__(idx)        
+        image_id = self.ids[idx]
+        annotations = {'image_id': image_id, 'annotations': annotations}
+        encoding = self.image_processor(images=images, annotations=annotations, return_tensors="pt")
+        pixel_values = encoding["pixel_values"].squeeze()
+        target = encoding["labels"][0]
+
+        return pixel_values, target
+
+
+# Example usage
+TRAIN_IMAGES = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-train/images"
+TRAIN_ANN = "/kaggle/working/VisDrone2019-DET-train_coco_annotations.json"
+
+VAL_IMAGES = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-val/images"
+VAL_ANN = "/kaggle/working/VisDrone2019-DET-val_coco_annotations.json"
+
+TEST_IMAGES = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-test-dev/images"
+TEST_ANN = "/kaggle/working/VisDrone2019-DET-test-dev_coco_annotations.json"
+
+TRAIN_DATASET = CocoDetection(
+    image_directory_path=TRAIN_IMAGES, 
+    annotation_file_path=TRAIN_ANN,
+    image_processor=image_processor,
+)
+VAL_DATASET = CocoDetection(
+    image_directory_path=VAL_IMAGES, 
+    annotation_file_path=VAL_ANN,
+    image_processor=image_processor,
+)
+TEST_DATASET = CocoDetection(
+    image_directory_path=TEST_IMAGES, 
+    annotation_file_path=TEST_ANN,
+    image_processor=image_processor,
+)
+
+print("Number of training examples:", len(TRAIN_DATASET))
+print("Number of validation examples:", len(VAL_DATASET))
+print("Number of test examples:", len(TEST_DATASET))
+
+import random
+import cv2
+import numpy as np
+
+
+# select random image
+image_ids = TRAIN_DATASET.coco.getImgIds()
+image_id = random.choice(image_ids)
+print('Image #{}'.format(image_id))
+
+# load image and annotatons 
+image = TRAIN_DATASET.coco.loadImgs(image_id)[0]
+annotations = TRAIN_DATASET.coco.imgToAnns[image_id]
+image_path = os.path.join(TRAIN_DATASET.root, image['file_name'])
+image = cv2.imread(image_path)
+
+# annotate
+detections = sv.Detections.from_coco_annotations(coco_annotation=annotations)
+
+# we will use id2label function for training
+categories = TRAIN_DATASET.coco.cats
+id2label = {k: v['name'] for k,v in categories.items()}
+
+labels = [
+    f"{id2label[class_id]}" 
+    for _, _, class_id, _ 
+    in detections
+]
+
+box_annotator = sv.BoxAnnotator()
+frame = box_annotator.annotate(scene=image, detections=detections, labels=labels)
+
+%matplotlib inline  
+sv.show_frame_in_notebook(image, (16, 16))
+
+from torch.utils.data import DataLoader
+
+def collate_fn(batch):
+    # DETR authors employ various image sizes during training, making it not possible 
+    # to directly batch together images. Hence they pad the images to the biggest 
+    # resolution in a given batch, and create a corresponding binary pixel_mask 
+    # which indicates which pixels are real/which are padding
+    pixel_values = [item[0] for item in batch]
+    encoding = image_processor.pad(pixel_values, return_tensors="pt")
+    labels = [item[1] for item in batch]
+    return {
+        'pixel_values': encoding['pixel_values'],
+        'pixel_mask': encoding['pixel_mask'],
+        'labels': labels
+    }
+
+TRAIN_DATALOADER = DataLoader(dataset=TRAIN_DATASET, collate_fn=collate_fn, batch_size=4, shuffle=True)
+VAL_DATALOADER = DataLoader(dataset=VAL_DATASET, collate_fn=collate_fn, batch_size=4)
+TEST_DATALOADER = DataLoader(dataset=TEST_DATASET, collate_fn=collate_fn, batch_size=4)
+
+import pytorch_lightning as pl
+from transformers import DetrForObjectDetection
+import torch
+
+
+class Detr(pl.LightningModule):
+
+    def __init__(self, lr, lr_backbone, weight_decay):
+        super().__init__()
+        self.model = DetrForObjectDetection.from_pretrained(
+            pretrained_model_name_or_path=CHECKPOINT, 
+            num_labels=len(id2label),
+            ignore_mismatched_sizes=True
+        )
+        
+        self.lr = lr
+        self.lr_backbone = lr_backbone
+        self.weight_decay = weight_decay
+
+    def forward(self, pixel_values, pixel_mask):
+        return self.model(pixel_values=pixel_values, pixel_mask=pixel_mask)
+
+    def common_step(self, batch, batch_idx):
+        pixel_values = batch["pixel_values"]
+        pixel_mask = batch["pixel_mask"]
+        labels = [{k: v.to(self.device) for k, v in t.items()} for t in batch["labels"]]
+
+        outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
+
+        loss = outputs.loss
+        loss_dict = outputs.loss_dict
+
+        return loss, loss_dict
+
+    def training_step(self, batch, batch_idx):
+        loss, loss_dict = self.common_step(batch, batch_idx)     
+        # logs metrics for each training_step, and the average across the epoch
+        self.log("training_loss", loss)
+        for k,v in loss_dict.items():
+            self.log("train_" + k, v.item())
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss, loss_dict = self.common_step(batch, batch_idx)     
+        self.log("validation/loss", loss)
+        for k, v in loss_dict.items():
+            self.log("validation_" + k, v.item())
+            
+        return loss
+
+    def configure_optimizers(self):
+        # DETR authors decided to use different learning rate for backbone
+        # you can learn more about it here: 
+        # - https://github.com/facebookresearch/detr/blob/3af9fa878e73b6894ce3596450a8d9b89d918ca9/main.py#L22-L23
+        # - https://github.com/facebookresearch/detr/blob/3af9fa878e73b6894ce3596450a8d9b89d918ca9/main.py#L131-L139
+        param_dicts = [
+            {
+                "params": [p for n, p in self.named_parameters() if "backbone" not in n and p.requires_grad]},
+            {
+                "params": [p for n, p in self.named_parameters() if "backbone" in n and p.requires_grad],
+                "lr": self.lr_backbone,
+            },
+        ]
+        return torch.optim.AdamW(param_dicts, lr=self.lr, weight_decay=self.weight_decay)
+
+    def train_dataloader(self):
+        return TRAIN_DATALOADER
+
+    def val_dataloader(self):
+        return VAL_DATALOADER
+
+%cd {HOME}
+
+%load_ext tensorboard
+%tensorboard --logdir lightning_logs/%cd {HOME}
+
+%load_ext tensorboard
+%tensorboard --logdir lightning_logs/
+
+model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4)
+
+batch = next(iter(TRAIN_DATALOADER))
+outputs = model(pixel_values=batch['pixel_values'], pixel_mask=batch['pixel_mask'])
+
+from pytorch_lightning import Trainer
+
+%cd {HOME}
+
+# settings
+MAX_EPOCHS = 8
+
+# pytorch_lightning < 2.0.0
+# trainer = Trainer(gpus=1, max_epochs=MAX_EPOCHS, gradient_clip_val=0.1, accumulate_grad_batches=8, log_every_n_steps=5)
+
+# pytorch_lightning >= 2.0.0
+trainer = Trainer(devices=1, accelerator="gpu", max_epochs=MAX_EPOCHS, gradient_clip_val=0.1, accumulate_grad_batches=8, log_every_n_steps=5)
+
+trainer.fit(model)
+
+model.to(DEVICE)
+
+import random
+import cv2
+import numpy as np
+import os
+import supervision as sv
+
+# utils
+categories = TEST_DATASET.coco.cats
+id2label = {k: v['name'] for k,v in categories.items()}
+box_annotator = sv.BoxAnnotator()
+
+# select random image
+image_ids = TEST_DATASET.coco.getImgIds()
+image_id = random.choice(image_ids)
+print('Image #{}'.format(image_id))
+
+# load image and annotations 
+image_info = TEST_DATASET.coco.loadImgs(image_id)[0]
+annotations = TEST_DATASET.coco.imgToAnns[image_id]
+image_path = os.path.join(TEST_DATASET.root, image_info['file_name'])
+
+# First check if file exists
+if not os.path.exists(image_path):
+    raise FileNotFoundError(f"Image file not found: {image_path}")
+
+image = cv2.imread(image_path)
+
+# Check if image was loaded properly
+if image is None:
+    raise ValueError(f"Failed to load image: {image_path}")
+
+# annotate
+detections = sv.Detections.from_coco_annotations(coco_annotation=annotations)
+labels = [f"{id2label[class_id]}" for _, _, class_id, _ in detections]
+frame = box_annotator.annotate(scene=image.copy(), detections=detections, labels=labels)
+
+print('ground truth')
+%matplotlib inline  
+sv.show_frame_in_notebook(frame, (16, 16))
+
+# Rest of your inference code...
+
+!pip install -q coco_eval
+
+def convert_to_xywh(boxes):
+    xmin, ymin, xmax, ymax = boxes.unbind(1)
+    return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=1)
+
+def prepare_for_coco_detection(predictions):
+    coco_results = []
+    for original_id, prediction in predictions.items():
+        if len(prediction) == 0:
+            continue
+
+        boxes = prediction["boxes"]
+        boxes = convert_to_xywh(boxes).tolist()
+        scores = prediction["scores"].tolist()
+        labels = prediction["labels"].tolist()
+
+        coco_results.extend(
+            [
+                {
+                    "image_id": original_id,
+                    "category_id": labels[k],
+                    "bbox": box,
+                    "score": scores[k],
+                }
+                for k, box in enumerate(boxes)
+            ]
+        )
+    return coco_results
+
+class SafeCocoDatasetWrapper:
+    def __init__(self, original_dataset):
+        self.original_dataset = original_dataset
+        
+    def __len__(self):
+        return len(self.original_dataset)
+        
+    def __getitem__(self, idx):
+        # Manually call the parent class's __getitem__ without using super()
+        image, annotations = self.original_dataset.__class__.__bases__[0].__getitem__(self.original_dataset, idx)
+        image_id = self.original_dataset.ids[idx]
+        annotations = {'image_id': image_id, 'annotations': annotations}
+        return {
+            "pixel_values": image,
+            "pixel_mask": None,  # Adjust as needed
+            "labels": annotations
+        }
+
+# Wrap your TEST_DATASET
+wrapped_dataset = SafeCocoDatasetWrapper(TEST_DATASET)
+TEST_DATALOADER = DataLoader(wrapped_dataset, batch_size=2, shuffle=False)
+
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+# Get ground truth annotations
+coco_gt = TEST_DATASET.coco
+
+# Prepare your predictions
+predictions = []
+for idx in tqdm(range(len(TEST_DATASET))):
+    image, _ = TEST_DATASET.__class__.__bases__[0].__getitem__(TEST_DATASET, idx)
+    image_id = TEST_DATASET.ids[idx]
+    
+    inputs = image_processor(images=image, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(DEVICE)
+    pixel_mask = inputs["pixel_mask"].to(DEVICE) if "pixel_mask" in inputs else None
+    
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
+    
+    target_size = torch.tensor([image.size[::-1]])
+    results = image_processor.post_process_object_detection(
+        outputs, 
+        target_sizes=target_size,
+        threshold=0.5
+    )[0]
+    
+    boxes = results["boxes"].cpu().numpy()
+    scores = results["scores"].cpu().numpy()
+    labels = results["labels"].cpu().numpy()
+    
+    for box, score, label in zip(boxes, scores, labels):
+        predictions.append({
+            "image_id": image_id,
+            "category_id": int(label),
+            "bbox": [float(box[0]), float(box[1]), float(box[2]-box[0]), float(box[3]-box[1])],
+            "score": float(score)
+        })
+
+# Evaluate using pycocotools directly
+coco_dt = coco_gt.loadRes(predictions)
+coco_eval = COCOeval(coco_gt, coco_dt, 'bbox')
+coco_eval.evaluate()
+coco_eval.accumulate()
+coco_eval.summarize()
+
+MODEL_PATH = os.path.join(HOME, 'custom-model')
+
+model.model.save_pretrained(MODEL_PATH)
+
+model = DetrForObjectDetection.from_pretrained(MODEL_PATH)
+model.to(DEVICE)
