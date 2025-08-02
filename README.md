@@ -2,10 +2,12 @@
 Single Object Tracking
 
 <br>
-First use "Yolov8m" for detection
+At first use "Yolov8m" for detection
 <br>
-Second use "Yolov8m+SAHI" for detection
+Then use "Yolov8m+SAHI" for detection
 <br>
 Compare performance improvement
 <br>
-Finally use "Tracking" for tracking the object
+You can also use "rfdetr" a transformer based model for performance evaluation
+<br>
+Finally, use "Tracking" for tracking the object
