@@ -1,0 +1,228 @@
+!pip install ultralytics
+
+import os
+import cv2
+import random
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from ultralytics import YOLO
+
+# Dataset paths
+dataset_path = "/kaggle/input/visdrone-dataset/VisDrone_Dataset"
+images_dir = os.path.join(dataset_path, "VisDrone2019-DET-train/images")
+labels_dir = os.path.join(dataset_path, "VisDrone2019-DET-train/labels")
+
+# Output directories
+output_dir = "/kaggle/working/visdrone_tiled"
+os.makedirs(output_dir, exist_ok=True)
+
+# Tiling parameters
+tile_size = 640  # YOLOv8 works well with 640x640
+overlap = 0.25   # 25% overlap between tiles
+min_obj_size = 4  # Minimum object size in pixels to keep
+min_visibility = 0.4  # Minimum visible area fraction to keep
+
+# Training parameters
+train_ratio = 0.8
+random_seed = 42
+
+def tile_dataset(images_dir, labels_dir, output_dir, tile_size, overlap, min_obj_size, min_visibility, mode='train'):
+    """Process images into tiles with corresponding labels"""
+    img_paths = list(Path(images_dir).glob("*.jpg"))
+    os.makedirs(os.path.join(output_dir, f"images/{mode}"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, f"labels/{mode}"), exist_ok=True)
+    
+    for img_path in tqdm(img_paths, desc=f"Processing {mode} images"):
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+            
+        h, w = img.shape[:2]
+        step = int(tile_size * (1 - overlap))
+        label_path = Path(labels_dir) / f"{img_path.stem}.txt"
+        
+        for y in range(0, h, step):
+            for x in range(0, w, step):
+                x_end, y_end = min(x + tile_size, w), min(y + tile_size, h)
+                if (x_end - x) < tile_size//2 or (y_end - y) < tile_size//2:
+                    continue
+                    
+                # Extract tile
+                tile = img[y:y_end, x:x_end]
+                tile_name = f"{img_path.stem}_{x}_{y}.jpg"
+                tile_path = os.path.join(output_dir, f"images/{mode}", tile_name)
+                cv2.imwrite(tile_path, tile)
+                
+                # Process labels
+                new_labels = []
+                if label_path.exists():
+                    with open(label_path, 'r') as f:
+                        for line in f:
+                            cls, cx, cy, bw, bh = map(float, line.strip().split())
+                            
+                            # Convert to absolute coordinates
+                            abs_cx, abs_cy = cx * w, cy * h
+                            abs_bw, abs_bh = bw * w, bh * h
+                            x1, y1 = abs_cx - abs_bw/2, abs_cy - abs_bh/2
+                            x2, y2 = abs_cx + abs_bw/2, abs_cy + abs_bh/2
+                            
+                            # Calculate intersection with tile
+                            inter_x1 = max(x1, x)
+                            inter_y1 = max(y1, y)
+                            inter_x2 = min(x2, x_end)
+                            inter_y2 = min(y2, y_end)
+                            
+                            # Check if object is visible in tile
+                            if inter_x1 < inter_x2 and inter_y1 < inter_y2:
+                                visible_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                                total_area = abs_bw * abs_bh
+                                visibility = visible_area / total_area
+                                
+                                if (visibility >= min_visibility and 
+                                    (inter_x2 - inter_x1) >= min_obj_size and 
+                                    (inter_y2 - inter_y1) >= min_obj_size):
+                                    
+                                    # Convert to tile-relative coordinates
+                                    tile_w = x_end - x
+                                    tile_h = y_end - y
+                                    new_cx = (inter_x1 + (inter_x2 - inter_x1)/2 - x) / tile_w
+                                    new_cy = (inter_y1 + (inter_y2 - inter_y1)/2 - y) / tile_h
+                                    new_bw = (inter_x2 - inter_x1) / tile_w
+                                    new_bh = (inter_y2 - inter_y1) / tile_h
+                                    
+                                    new_labels.append(f"{int(cls)} {new_cx:.6f} {new_cy:.6f} {new_bw:.6f} {new_bh:.6f}\n")
+                
+                # Save labels
+                if new_labels:
+                    label_out_path = os.path.join(output_dir, f"labels/{mode}", tile_name.replace('.jpg', '.txt'))
+                    with open(label_out_path, 'w') as f:
+                        f.writelines(new_labels)
+# Define your existing dataset paths
+train_images_dir = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-train/images"
+train_labels_dir = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-train/labels"
+val_images_dir = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-val/images"
+val_labels_dir = "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-val/labels"
+
+# Output directories (where tiles will be saved)
+output_dir = "/kaggle/working/visdrone_tiled"
+os.makedirs(output_dir, exist_ok=True)
+
+# Tiling parameters
+tile_size = 640  # YOLOv8 works well with 640x640
+overlap = 0.25   # 25% overlap between tiles
+min_obj_size = 4  # Minimum object size in pixels to keep
+min_visibility = 0.4  # Minimum visible area fraction to keep
+
+# Process training set
+print("Processing training set...")
+tile_dataset(
+    images_dir=train_images_dir,
+    labels_dir=train_labels_dir,
+    output_dir=output_dir,
+    tile_size=tile_size,
+    overlap=overlap,
+    min_obj_size=min_obj_size,
+    min_visibility=min_visibility,
+    mode='train'
+)
+
+# Process validation set
+print("\nProcessing validation set...")
+tile_dataset(
+    images_dir=val_images_dir,
+    labels_dir=val_labels_dir,
+    output_dir=output_dir,
+    tile_size=tile_size,
+    overlap=overlap,
+    min_obj_size=min_obj_size,
+    min_visibility=min_visibility,
+    mode='val'
+)
+
+# Create dataset YAML file
+yaml_content = f"""
+path: {output_dir}
+train: images/train
+val: images/val
+
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor
+"""
+
+yaml_path = os.path.join(output_dir, "visdrone_tiled.yaml")
+with open(yaml_path, 'w') as f:
+    f.write(yaml_content.strip())
+
+print("\nDataset preparation complete!")
+print(f"YAML configuration saved to: {yaml_path}")
+
+from ultralytics import YOLO
+
+# Load pretrained YOLO V8
+model = YOLO("yolo8m.pt")
+
+results = model.train(
+    data=yaml_path,
+    epochs=10,
+    imgsz=tile_size,
+    batch=8,
+    patience=10,
+    name="yolov11n_visdrone_tiled",
+    project="visdrone_project",
+    mosaic=0.5,  # Lower mosaic for tiled training
+    mixup=0.1,   # Reduced mixup
+    copy_paste=0.1,
+    hsv_h=0.015,
+    hsv_s=0.7,
+    hsv_v=0.4,
+    fliplr=0.5,
+    cache=True,
+    single_cls=False,
+    optimizer="auto",
+    lr0=0.01,
+    close_mosaic=10,
+)
+
+# First process test set (similar to val)
+test_images_dir = os.path.join(dataset_path, "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-test-dev/images")
+test_labels_dir = os.path.join(dataset_path, "/kaggle/input/visdrone-dataset/VisDrone_Dataset/VisDrone2019-DET-test-dev/labels")
+
+tile_dataset(test_images_dir, test_labels_dir, output_dir, tile_size, overlap, min_obj_size, min_visibility, 'test')
+
+# Update YAML to include test path
+with open(yaml_path, 'a') as f:
+    f.write(f"\ntest: images/test")
+
+# Evaluate
+metrics = model.val(
+    data=yaml_path,
+    split='test',
+    imgsz=tile_size,
+    batch=8,
+    conf=0.001,
+    iou=0.6,
+    name='yolov8m_visdrone_tiled_eval'
+)
+
+# Print comprehensive metrics
+print("\n📊 Comprehensive Evaluation Results:")
+print(f"mAP@0.50: {metrics.box.map50:.4f}")
+print(f"mAP@0.50:0.95: {metrics.box.map:.4f}")
+print(f"Precision: {metrics.box.mp.mean():.4f}")
+print(f"Recall: {metrics.box.mr.mean():.4f}")
+print("\nPer-class metrics:")
+for i, name in enumerate(metrics.names.values()):
+    print(f"{name:20} AP@0.50: {metrics.box.ap50[i]:.4f} AP@0.50:0.95: {metrics.box.ap[i]:.4f}")
+
+
